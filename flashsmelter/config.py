@@ -66,6 +66,23 @@ _ENV_FIELDS: dict[str, Any] = {
     "furnace_purge_seconds": float,
     "furnace_min_smelt_dwell_seconds": float,
     "furnace_transition_timeout_seconds": float,
+    "acid_so2_load_design_kgph": float,
+    "acid_so2_load_high_ratio": float,
+    "acid_acid_strength_target": float,
+    "acid_acid_strength_warn_low": float,
+    "acid_acid_strength_warn_high": float,
+    "acid_acid_strength_hard_low": float,
+    "acid_acid_strength_hard_high": float,
+    "acid_tail_so2_warn_mgm3": float,
+    "acid_tail_so2_limit_mgm3": float,
+    "acid_tail_so2_clear_mgm3": float,
+    "acid_required_conversion_floor": float,
+    "acid_analyzer_window_seconds": float,
+    "acid_sample_stale_seconds": float,
+    "acid_gas_nm3_per_ton_feed": float,
+    "acid_gas_base_nm3h": float,
+    "acid_min_hold_seconds": float,
+    "acid_clear_dwell_seconds": float,
 }
 
 
@@ -120,6 +137,26 @@ class Settings:
     furnace_purge_seconds: float = 15.0
     furnace_min_smelt_dwell_seconds: float = 45.0
     furnace_transition_timeout_seconds: float = 600.0
+
+    # 制酸与尾气联动：SO2 质量负荷按入口烟气量与 SO2 浓度提前核算，
+    # 酸浓/尾气越线先降料带安全侧，超标时段与处置过程全部留证。
+    acid_so2_load_design_kgph: float = 3000.0
+    acid_so2_load_high_ratio: float = 0.85
+    acid_acid_strength_target: float = 0.985
+    acid_acid_strength_warn_low: float = 0.980
+    acid_acid_strength_warn_high: float = 0.992
+    acid_acid_strength_hard_low: float = 0.975
+    acid_acid_strength_hard_high: float = 0.995
+    acid_tail_so2_warn_mgm3: float = 200.0
+    acid_tail_so2_limit_mgm3: float = 400.0
+    acid_tail_so2_clear_mgm3: float = 100.0
+    acid_required_conversion_floor: float = 0.995
+    acid_analyzer_window_seconds: float = 300.0
+    acid_sample_stale_seconds: float = 180.0
+    acid_gas_nm3_per_ton_feed: float = 500.0
+    acid_gas_base_nm3h: float = 42000.0
+    acid_min_hold_seconds: float = 60.0
+    acid_clear_dwell_seconds: float = 300.0
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> "Settings":
@@ -242,6 +279,67 @@ class Settings:
                     "purge": self.furnace_purge_seconds,
                 },
             )
+        if self.acid_so2_load_design_kgph <= 0:
+            raise ValidationError("制酸设计 SO2 负荷必须为正", details={"load": self.acid_so2_load_design_kgph})
+        if not 0 < self.acid_so2_load_high_ratio < 1:
+            raise ValidationError(
+                "制酸高负荷系数必须是 (0,1) 区间比例", details={"ratio": self.acid_so2_load_high_ratio}
+            )
+        if not 0 < self.acid_acid_strength_hard_low < self.acid_acid_strength_warn_low:
+            raise ValidationError(
+                "酸浓硬下限必须低于预警下限",
+                details={
+                    "hard_low": self.acid_acid_strength_hard_low,
+                    "warn_low": self.acid_acid_strength_warn_low,
+                },
+            )
+        if not self.acid_acid_strength_warn_low < self.acid_acid_strength_target < self.acid_acid_strength_warn_high:
+            raise ValidationError(
+                "酸浓目标值必须落在预警区间内",
+                details={
+                    "target": self.acid_acid_strength_target,
+                    "warn_low": self.acid_acid_strength_warn_low,
+                    "warn_high": self.acid_acid_strength_warn_high,
+                },
+            )
+        if not self.acid_acid_strength_warn_high < self.acid_acid_strength_hard_high < 1:
+            raise ValidationError(
+                "酸浓硬上限必须高于预警上限且小于 1",
+                details={
+                    "warn_high": self.acid_acid_strength_warn_high,
+                    "hard_high": self.acid_acid_strength_hard_high,
+                },
+            )
+        if not 0 < self.acid_tail_so2_clear_mgm3 < self.acid_tail_so2_warn_mgm3 < self.acid_tail_so2_limit_mgm3:
+            raise ValidationError(
+                "尾气阈值必须满足 解除<预警<排放限值",
+                details={
+                    "clear": self.acid_tail_so2_clear_mgm3,
+                    "warn": self.acid_tail_so2_warn_mgm3,
+                    "limit": self.acid_tail_so2_limit_mgm3,
+                },
+            )
+        if not 0 < self.acid_required_conversion_floor < 1:
+            raise ValidationError(
+                "最低转化率要求必须是 (0,1) 区间比例",
+                details={"floor": self.acid_required_conversion_floor},
+            )
+        if self.acid_analyzer_window_seconds <= 0:
+            raise ValidationError("制酸分析仪基线窗口必须为正", details={"window": self.acid_analyzer_window_seconds})
+        if self.acid_sample_stale_seconds <= 0:
+            raise ValidationError("制酸样本失效窗口必须为正", details={"stale": self.acid_sample_stale_seconds})
+        if self.acid_gas_nm3_per_ton_feed <= 0:
+            raise ValidationError(
+                "吨精矿烟气产率必须为正", details={"gas_per_ton": self.acid_gas_nm3_per_ton_feed}
+            )
+        if self.acid_gas_base_nm3h < 0:
+            raise ValidationError(
+                "固定漏风烟气底数不能为负", details={"gas_base": self.acid_gas_base_nm3h}
+            )
+        if self.acid_min_hold_seconds < 0:
+            raise ValidationError("联锁最短保持时长不能为负", details={"hold": self.acid_min_hold_seconds})
+        if self.acid_clear_dwell_seconds <= 0:
+            raise ValidationError("尾气解除持续时长必须为正", details={"dwell": self.acid_clear_dwell_seconds})
 
     def with_root(self, root: Path | str) -> "Settings":
         updated = replace(self, root=Path(root))

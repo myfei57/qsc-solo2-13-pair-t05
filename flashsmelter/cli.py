@@ -144,6 +144,20 @@ def _cmd_heat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_acid(args: argparse.Namespace) -> int:
+    application = Application(_build_settings(args))
+    if getattr(args, "incident_id", None):
+        _print(application.acid_evidence(args.incident_id))
+        return 0
+    _print(
+        {
+            "acid": dict(application.acid.status()),
+            "incidents": application.acid_incidents(limit=args.limit),
+        }
+    )
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     application = Application(_build_settings(args))
     report = application.verify()
@@ -191,6 +205,11 @@ def build_parser() -> argparse.ArgumentParser:
     heat = subparsers.add_parser("heat", help="打印炉次与转炉批次")
     heat.add_argument("--limit", type=int, default=5)
     heat.set_defaults(func=_cmd_heat)
+
+    acid = subparsers.add_parser("acid", help="打印制酸状态、排放事件与证据")
+    acid.add_argument("--limit", type=int, default=20)
+    acid.add_argument("--incident-id", help="导出指定排放事件的完整证据包")
+    acid.set_defaults(func=_cmd_acid)
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)

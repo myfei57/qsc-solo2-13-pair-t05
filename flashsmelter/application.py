@@ -10,6 +10,7 @@ from typing import Any, Callable, Mapping
 
 from .audit import AuditLog
 from .burner import Burner
+from .acid import AcidPlant
 from .component import Component, ensure_actor
 from .conc import ConcentrateSystem
 from .config import Settings
@@ -61,6 +62,7 @@ class Application:
         self.waste = WasteHeatBoiler(ctx)
         self.settler = Settler(ctx)
         self.oxygen = OxygenSystem(ctx)
+        self.acid = AcidPlant(ctx)
         self.slag = SlagTap(ctx, settler=self.settler, waste=self.waste)
         self.matte = MatteTap(ctx, settler=self.settler, waste=self.waste, slag=self.slag)
         self.conv = Converter(ctx, matte=self.matte)
@@ -77,10 +79,12 @@ class Application:
             matte=self.matte,
             waste=self.waste,
             converter=self.conv,
+            acid=self.acid,
         )
         self.slag.bind_matte(self.matte)
         self.matte.bind_converter(self.conv)
         self.oxygen.bind_feed_port(self.conc)
+        self.acid.bind_furnace(self.furnace)
         self.components: tuple[Component, ...] = (
             self.furnace,
             self.burner,
@@ -91,6 +95,7 @@ class Application:
             self.matte,
             self.conv,
             self.waste,
+            self.acid,
         )
         self._by_name: dict[str, Component] = {component.name: component for component in self.components}
 
@@ -471,6 +476,99 @@ class Application:
                 expected_generation=params.optional_number("expected_generation"),
             )
 
+        @register("furnace.safe_side")
+        def _furnace_safe_side(params: Params) -> Mapping[str, Any]:
+            return self.furnace.bring_to_safe_side(
+                params.text("actor", required=False, default="control-room"),
+                reason=params.text("reason"),
+                detail=params.mapping("detail"),
+                correlation_id=params.optional_text("correlation_id"),
+            )
+
+        @register("furnace.release_safeguard")
+        def _furnace_release_safeguard(params: Params) -> Mapping[str, Any]:
+            return self.furnace.release_safeguard(
+                params.text("actor", required=False, default="control-room"),
+                note=params.text("note"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.online")
+        def _acid_online(params: Params) -> Mapping[str, Any]:
+            return self.acid.online(
+                params.text("actor", required=False, default="control-room"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.offline")
+        def _acid_offline(params: Params) -> Mapping[str, Any]:
+            return self.acid.offline(
+                params.text("actor", required=False, default="control-room"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.set_baseline")
+        def _acid_baseline(params: Params) -> Mapping[str, Any]:
+            return self.acid.set_baseline(
+                params.text("actor", required=False, default="control-room"),
+                value=params.number("value", minimum=0.0, maximum=1.0),
+                source=params.text("source"),
+                observed_at=params.optional_text("observed_at"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.sample")
+        def _acid_sample(params: Params) -> Mapping[str, Any]:
+            return self.acid.sample(
+                params.text("actor", required=False, default="analyzer"),
+                gas_flow_nm3h=params.number("gas_flow_nm3h", minimum=0.0),
+                so2_fraction=params.number("so2_fraction", minimum=0.0, maximum=1.0),
+                acid_strength=params.number("acid_strength", minimum=0.0, maximum=1.0),
+                tail_so2_mgm3=params.number("tail_so2_mgm3", minimum=0.0),
+                observed_at=params.optional_text("observed_at"),
+                correlation_id=params.optional_text("correlation_id"),
+            )
+
+        @register("acid.safeguard")
+        def _acid_safeguard(params: Params) -> Mapping[str, Any]:
+            return self.acid.safeguard(
+                params.text("actor", required=False, default="control-room"),
+                reason=params.text("reason"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.reset")
+        def _acid_reset(params: Params) -> Mapping[str, Any]:
+            return self.acid.reset(
+                params.text("actor", required=False, default="control-room"),
+                note=params.text("note"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.disposition")
+        def _acid_disposition(params: Params) -> Mapping[str, Any]:
+            return self.acid.record_disposition(
+                params.text("actor", required=False, default="control-room"),
+                note=params.text("note"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.close_incident")
+        def _acid_close_incident(params: Params) -> Mapping[str, Any]:
+            return self.acid.close_incident(
+                params.text("actor", required=False, default="control-room"),
+                note=params.text("note"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
         @register("waste.start")
         def _waste_start(params: Params) -> Mapping[str, Any]:
             return self.waste.start(
@@ -570,6 +668,12 @@ class Application:
             actor=actor,
         )
         return [event.to_dict() for event in events]
+
+    def acid_incidents(self, *, limit: int = 20) -> list[Mapping[str, Any]]:
+        return [dict(event) for event in self.acid.incidents(limit=limit)]
+
+    def acid_evidence(self, incident_id: str) -> Mapping[str, Any]:
+        return self.acid.evidence_bundle(incident_id)
 
     def verify(self) -> Mapping[str, Any]:
         report = self.store.verify()

@@ -13,6 +13,7 @@ from ..component import Component, ensure_actor
 from ..errors import GuardViolation, StateTransitionError
 from ..machine import StateMachine
 from ..ports import (
+    AcidPort,
     BurnerPort,
     ConverterPort,
     FeedPort,
@@ -24,14 +25,25 @@ from ..ports import (
 )
 from ..runtime import RuntimeContext
 
-STATES = ("cold", "purging", "oxygen_ready", "smelting", "tapping", "stopping", "stopped", "latched")
+STATES = (
+    "cold",
+    "purging",
+    "oxygen_ready",
+    "smelting",
+    "tapping",
+    "safeguarded",
+    "stopping",
+    "stopped",
+    "latched",
+)
 
 TRANSITIONS: Mapping[str, tuple[str, ...]] = {
     "cold": ("purging", "latched"),
-    "purging": ("oxygen_ready", "stopping", "latched"),
-    "oxygen_ready": ("smelting", "stopping", "latched"),
-    "smelting": ("tapping", "stopping", "latched"),
-    "tapping": ("smelting", "stopping", "latched"),
+    "purging": ("oxygen_ready", "stopping", "safeguarded", "latched"),
+    "oxygen_ready": ("smelting", "stopping", "safeguarded", "latched"),
+    "smelting": ("tapping", "stopping", "safeguarded", "latched"),
+    "tapping": ("smelting", "stopping", "safeguarded", "latched"),
+    "safeguarded": ("smelting", "oxygen_ready", "stopping", "latched"),
     "stopping": ("stopped", "latched"),
     "stopped": ("purging", "cold", "latched"),
     "latched": ("cold",),
@@ -55,6 +67,7 @@ class FlashFurnace(Component):
         matte: MattePort,
         waste: WastePort,
         converter: ConverterPort,
+        acid: AcidPort | None = None,
     ) -> None:
         super().__init__(ctx)
         self._machine = StateMachine("furnace", "cold", TRANSITIONS, ctx.clock)
@@ -66,12 +79,15 @@ class FlashFurnace(Component):
         self._matte = matte
         self._waste = waste
         self._converter = converter
+        self._acid = acid
         self._heat_id: str | None = None
         self._started_at: str | None = None
         self._purge_started_at: float | None = None
         self._smelt_started_at: float | None = None
         self._last_tap_at: str | None = None
         self._latch_reason: str | None = None
+        self._safeguard_reason: str | None = None
+        self._safeguard_return_state: str | None = None
         self._heats: list[dict[str, Any]] = []
         restored = self.restore()
         if restored is not None:
@@ -82,6 +98,8 @@ class FlashFurnace(Component):
             self._smelt_started_at = restored.get("smelt_started_at")
             self._last_tap_at = restored.get("last_tap_at")
             self._latch_reason = restored.get("latch_reason")
+            self._safeguard_reason = restored.get("safeguard_reason")
+            self._safeguard_return_state = restored.get("safeguard_return_state")
             heats = restored.get("heats")
             if isinstance(heats, list):
                 self._heats = [entry for entry in heats if isinstance(entry, dict)]
@@ -158,6 +176,7 @@ class FlashFurnace(Component):
             self._require_startup_window()
             if self._waste.is_latched():
                 raise GuardViolation("余热锅炉闩锁未复位，禁止喷吹")
+            self._require_acid_gate(rate_tph)
             conc_status = self._conc.status()
             if conc_status["state"] == "blocked" or conc_status["heat_id"] != heat_id:
                 self._conc.arm(actor, heat_id=heat_id)
@@ -253,7 +272,9 @@ class FlashFurnace(Component):
             expected_generation=expected_generation,
             bump_generation=True,
         ) as trace:
-            self._machine.require_one_of(("oxygen_ready", "smelting", "tapping", "purging"), "停机")
+            self._machine.require_one_of(
+                ("oxygen_ready", "smelting", "tapping", "purging", "safeguarded"), "停机"
+            )
             self._machine.to("stopping", actor, "按顺序停机")
             self._persist(reason="stopping")
             conc_state = self._conc.status()["state"]
@@ -269,6 +290,8 @@ class FlashFurnace(Component):
             self._machine.to("stopped", actor, "停机完成")
             self._smelt_started_at = None
             self._purge_started_at = None
+            self._safeguard_reason = None
+            self._safeguard_return_state = None
             record = self._persist(reason="stop")
             trace.attach(record)
             return self.status()
@@ -329,6 +352,104 @@ class FlashFurnace(Component):
             trace.attach(record).note("note", note)
             return self.status()
 
+    def bring_to_safe_side(
+        self,
+        actor: str,
+        *,
+        reason: str,
+        detail: Mapping[str, Any] | None = None,
+        correlation_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        """制酸/尾气越线时的安全侧动作：先停喷吹，再降富氧，烟气负荷优先压下来。
+
+        与炉体硬联锁（latched）不同，安全态是可恢复的：测点回落后由制酸段复位
+        并调用 :meth:`release_safeguard` 回到原工况，炉子全程不冷却。
+        """
+
+        actor = ensure_actor(actor)
+        with self.action(
+            "bring_to_safe_side",
+            "furnace",
+            actor,
+            correlation_id=correlation_id,
+            bump_generation=True,
+        ) as trace:
+            if not reason:
+                raise GuardViolation("安全侧动作必须给出原因")
+            if self._machine.state == "safeguarded":
+                raise StateTransitionError(
+                    "炉子已处于安全态，无需重复处置", details={"reason": self._safeguard_reason}
+                )
+            if self._machine.state in ("cold", "stopped", "latched", "stopping"):
+                raise StateTransitionError(
+                    "当前炉况不支持安全侧处置", details={"state": self._machine.state}
+                )
+            previous_state = self._machine.state
+            intent = self.write_intent(
+                "bring_to_safe_side",
+                {
+                    "action": "bring_to_safe_side",
+                    "reason": reason,
+                    "detail": dict(detail or {}),
+                    "from_state": previous_state,
+                    "at": self.clock.timestamp_iso(),
+                    "actor": actor,
+                },
+            )
+            conc_state = self._conc.status()["state"]
+            feed_was_flowing = conc_state in ("armed", "injecting", "paused")
+            if feed_was_flowing:
+                self._conc.stop(actor)  # 先停精矿喷吹，切断 SO2 负荷来源
+            oxygen_state = self._oxygen.status()["state"]
+            if oxygen_state in ("established", "ramping"):
+                self._oxygen.ramp_down(actor)  # 再降富氧，避免还原性烟气冲击转化器
+            self._machine.to("safeguarded", actor, f"转入安全态：{reason}")
+            self._safeguard_reason = reason
+            self._safeguard_return_state = previous_state
+            record = self._persist(reason="bring_to_safe_side")
+            trace.attach(record).note("reason", reason).note("intent_version", intent.version)
+            trace.note("feed_stopped", feed_was_flowing)
+            return self.status()
+
+    def release_safeguard(
+        self,
+        actor: str,
+        *,
+        note: str,
+        correlation_id: str | None = None,
+        expected_generation: int | None = None,
+    ) -> Mapping[str, Any]:
+        """解除安全态：必须确认制酸段门控恢复允许后，才能回到原工况。"""
+
+        actor = ensure_actor(actor)
+        with self.action(
+            "release_safeguard",
+            "furnace",
+            actor,
+            correlation_id=correlation_id,
+            expected_generation=expected_generation,
+            bump_generation=True,
+        ) as trace:
+            self._machine.require("safeguarded", "解除安全态")
+            if not note:
+                raise GuardViolation("解除安全态必须填写说明")
+            if self._acid is not None:
+                gate = self._acid.feed_gate()
+                if not gate["allowed"]:
+                    raise GuardViolation(
+                        "制酸段门控仍未恢复，禁止解除安全态",
+                        details={"blockers": gate["blockers"], "mode": gate["mode"]},
+                    )
+            target = self._safeguard_return_state or "oxygen_ready"
+            if target not in ("smelting", "oxygen_ready"):
+                target = "oxygen_ready"
+            self._machine.to(target, actor, f"解除安全态：{note}")
+            self._safeguard_reason = None
+            self._safeguard_return_state = None
+            record = self._persist(reason="release_safeguard")
+            trace.attach(record).note("note", note).note("target_state", target)
+            return self.status()
+
     # ------------------------------------------------------------------ 查询
     @property
     def state(self) -> str:
@@ -375,6 +496,8 @@ class FlashFurnace(Component):
             "started_at": self._started_at,
             "last_tap_at": self._last_tap_at,
             "latch_reason": self._latch_reason,
+            "safeguard_reason": self._safeguard_reason,
+            "safeguard_return_state": self._safeguard_return_state,
             "smelt_dwell_remaining_seconds": round(self.smelt_dwell_remaining(), 3),
             "purge_remaining_seconds": round(self.purge_remaining(), 3),
             "heats": list(self._heats[-4:]),
@@ -386,7 +509,9 @@ class FlashFurnace(Component):
                 "slag": self._slag.status()["state"],
                 "matte": self._matte.status()["state"],
                 "waste": self._waste.status()["state"],
+                "acid": None if self._acid is None else self._acid.status()["state"],
             },
+            "acid_gate": None if self._acid is None else dict(self._acid.feed_gate()),
             "history": list(self._machine.history),
         }
 
@@ -403,6 +528,8 @@ class FlashFurnace(Component):
             "smelt_started_at": self._smelt_started_at,
             "last_tap_at": self._last_tap_at,
             "latch_reason": self._latch_reason,
+            "safeguard_reason": self._safeguard_reason,
+            "safeguard_return_state": self._safeguard_return_state,
             "heats": list(self._heats[-8:]),
             "history": list(self._machine.history),
         }
@@ -424,6 +551,41 @@ class FlashFurnace(Component):
                     "timeout_seconds": self.settings.furnace_transition_timeout_seconds,
                 },
             )
+
+    def bind_acid(self, acid: AcidPort) -> None:
+        """注入制酸段门控：喷吹速率受前馈负荷上限约束，越线时硬停。"""
+
+        self._acid = acid
+
+    def _require_acid_gate(self, rate_tph: float) -> None:
+        """把制酸段按烟气量/SO2 浓度提出的要求落实到喷吹指令上。"""
+
+        if self._acid is None:
+            return
+        gate = self._acid.feed_gate()
+        if gate["hard_block"]:
+            raise GuardViolation(
+                "制酸段处于联锁（酸浓/尾气顶线），喷吹一律拒绝，炉子先处安全态",
+                details={"blockers": gate["blockers"], "acid": dict(self._acid.status())},
+            )
+        max_rate = gate.get("max_rate_tph")
+        if gate["mode"] == "load-capped" and max_rate is not None and rate_tph > max_rate:
+            raise GuardViolation(
+                "喷吹速率超过制酸段按 SO2 负荷反推的上限",
+                details={
+                    "rate_tph": rate_tph,
+                    "max_rate_tph": max_rate,
+                    "demand": gate["demand"],
+                },
+            )
+        # 样本失效时不硬停炉子，但禁止加负荷：已经在喷时只能维持或降低。
+        if gate.get("stale") and self._conc.is_flowing():
+            current_rate = self._conc.status().get("last_rate_tph", 0.0)
+            if rate_tph > current_rate:
+                raise GuardViolation(
+                    "制酸样本失效期间禁止加大喷吹负荷",
+                    details={"requested_tph": rate_tph, "current_tph": current_rate, "gate": gate},
+                )
 
     def _refresh_gauges(self) -> None:
         self.metrics.observe("furnace.state_code", float(STATES.index(self._machine.state)))

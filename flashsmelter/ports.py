@@ -75,6 +75,30 @@ class SlagPort(Protocol):
     def status(self) -> Mapping[str, Any]: ...
 
 
+@runtime_checkable
+class AcidPort(Protocol):
+    """制酸段对炉子侧暴露的门控与前馈接口。"""
+
+    def is_latched(self) -> bool: ...
+
+    def feed_gate(self) -> Mapping[str, Any]: ...
+
+    def demand(self) -> Mapping[str, Any]: ...
+
+    def status(self) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class FurnaceSafetyPort(Protocol):
+    """制酸段越限时，把炉子带到安全侧的执行端口。"""
+
+    def bring_to_safe_side(
+        self, actor: str, *, reason: str, detail: Mapping[str, Any], correlation_id: str | None
+    ) -> Mapping[str, Any]: ...
+
+    def status(self) -> Mapping[str, Any]: ...
+
+
 __all__ = [
     "BurnerPort",
     "FeedPort",
@@ -84,4 +108,6 @@ __all__ = [
     "MattePort",
     "ConverterPort",
     "SlagPort",
+    "AcidPort",
+    "FurnaceSafetyPort",
 ]

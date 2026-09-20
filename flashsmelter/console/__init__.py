@@ -112,6 +112,8 @@ class ConsoleApp:
         self.router.add("GET", "/api/actions", self._actions)
         self.router.add("GET", "/api/audit", self._audit)
         self.router.add("GET", "/api/heats", self._heats)
+        self.router.add("GET", "/api/acid/incidents", self._acid_incidents)
+        self.router.add("GET", "/api/acid/incidents/{incident_id}", self._acid_evidence)
         self.router.add("GET", "/api/components", self._components)
         self.router.add("GET", "/api/components/{component}", self._component)
         self.router.add("GET", "/api/zones", self._zones)
@@ -189,6 +191,22 @@ class ConsoleApp:
             "current": dict(self.application.furnace.heat_report()),
             "heats": [dict(item) for item in self.application.furnace.heats(limit=limit)],
         }
+
+    def _acid_incidents(self, _path: Mapping[str, str], params: Mapping[str, Any]) -> Mapping[str, Any]:
+        from ..params import Params
+
+        parsed = Params(params, source="http:acid-incidents")
+        limit = parsed.integer("limit", required=False, default=20, minimum=1, maximum=500)
+        events = self.application.acid_incidents(limit=limit)
+        return {
+            "count": len(events),
+            "acid_state": self.application.acid.status()["state"],
+            "open_incident_id": self.application.acid.status()["open_incident_id"],
+            "incidents": events,
+        }
+
+    def _acid_evidence(self, path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
+        return self.application.acid_evidence(path["incident_id"])
 
     def _components(self, _path: Mapping[str, str], _params: Mapping[str, Any]) -> Mapping[str, Any]:
         return {
