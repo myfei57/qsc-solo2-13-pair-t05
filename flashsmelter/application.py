@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from typing import Any, Callable, Mapping
 
+from .acid import AcidPlant
 from .audit import AuditLog
 from .burner import Burner
 from .component import Component, ensure_actor
@@ -24,6 +25,7 @@ from .runtime import Clock, Generation, Metrics, RuntimeContext
 from .settler import Settler
 from .slag import SlagTap
 from .store import DurableStore
+from .tail import TailGasMonitor
 from .waste import WasteHeatBoiler
 
 ActionHandler = Callable[[Params], Mapping[str, Any]]
@@ -67,6 +69,8 @@ class Application:
         self.conc = ConcentrateSystem(
             ctx, burner=self.burner, oxygen=self.oxygen, waste=self.waste, settler=self.settler
         )
+        self.acid = AcidPlant(ctx)
+        self.tail = TailGasMonitor(ctx)
         self.furnace = FlashFurnace(
             ctx,
             burner=self.burner,
@@ -81,6 +85,9 @@ class Application:
         self.slag.bind_matte(self.matte)
         self.matte.bind_converter(self.conv)
         self.oxygen.bind_feed_port(self.conc)
+        self.furnace.bind_offgas(acid=self.acid, tail=self.tail)
+        self.acid.bind_safety_port(self.furnace)
+        self.tail.bind_safety_port(self.furnace)
         self.components: tuple[Component, ...] = (
             self.furnace,
             self.burner,
@@ -91,6 +98,8 @@ class Application:
             self.matte,
             self.conv,
             self.waste,
+            self.acid,
+            self.tail,
         )
         self._by_name: dict[str, Component] = {component.name: component for component in self.components}
 
@@ -516,6 +525,56 @@ class Application:
                 drum_level=params.number("drum_level", minimum=0.0, maximum=1.0),
                 exhaust_temp_c=params.number("exhaust_temp_c", minimum=0.0),
                 tube_leak=params.boolean("tube_leak", required=False, default=False),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.forecast")
+        def _acid_forecast(params: Params) -> Mapping[str, Any]:
+            return self.acid.forecast(
+                params.text("actor", required=False, default="control-room"),
+                gas_flow_nm3h=params.number("gas_flow_nm3h", minimum=0.0),
+                so2_percent=params.number("so2_percent", minimum=0.0, maximum=100.0),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.update")
+        def _acid_update(params: Params) -> Mapping[str, Any]:
+            return self.acid.update(
+                params.text("actor", required=False, default="control-room"),
+                conversion_rate=params.number("conversion_rate", minimum=0.0, maximum=1.0),
+                acid_conc_93=params.number("acid_conc_93", minimum=0.0, maximum=100.0),
+                acid_conc_98=params.number("acid_conc_98", minimum=0.0, maximum=100.0),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("acid.clear")
+        def _acid_clear(params: Params) -> Mapping[str, Any]:
+            return self.acid.clear(
+                params.text("actor", required=False, default="control-room"),
+                note=params.text("note"),
+                correlation_id=params.optional_text("correlation_id"),
+                expected_generation=params.optional_number("expected_generation"),
+            )
+
+        @register("tail.reading")
+        def _tail_reading(params: Params) -> Mapping[str, Any]:
+            return self.tail.reading(
+                params.text("actor", required=False, default="cems"),
+                so2_mg_nm3=params.number("so2_mg_nm3", minimum=0.0),
+                observed_at=params.optional_text("observed_at"),
+                correlation_id=params.optional_text("correlation_id"),
+            )
+
+        @register("tail.disposition")
+        def _tail_disposition(params: Params) -> Mapping[str, Any]:
+            return self.tail.disposition(
+                params.text("actor", required=False, default="control-room"),
+                episode_id=params.text("episode_id"),
+                cause=params.text("cause"),
+                measures=params.text("measures"),
                 correlation_id=params.optional_text("correlation_id"),
                 expected_generation=params.optional_number("expected_generation"),
             )

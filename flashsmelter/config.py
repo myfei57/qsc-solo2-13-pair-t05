@@ -66,6 +66,15 @@ _ENV_FIELDS: dict[str, Any] = {
     "furnace_purge_seconds": float,
     "furnace_min_smelt_dwell_seconds": float,
     "furnace_transition_timeout_seconds": float,
+    "acid_gas_flow_max_nm3h": float,
+    "acid_converter_so2_max_percent": float,
+    "acid_conversion_guaranteed": float,
+    "acid_conc93_min": float,
+    "acid_conc93_max": float,
+    "acid_conc98_min": float,
+    "acid_conc98_max": float,
+    "tail_so2_warn_mg_nm3": float,
+    "tail_so2_limit_mg_nm3": float,
 }
 
 
@@ -120,6 +129,19 @@ class Settings:
     furnace_purge_seconds: float = 15.0
     furnace_min_smelt_dwell_seconds: float = 45.0
     furnace_transition_timeout_seconds: float = 600.0
+
+    # 制酸前馈与酸浓窗口：烟气量×SO2 浓度折算的负荷不得顶到转化吸收能力边界。
+    acid_gas_flow_max_nm3h: float = 120000.0
+    acid_converter_so2_max_percent: float = 12.0
+    acid_conversion_guaranteed: float = 0.9985
+    acid_conc93_min: float = 92.5
+    acid_conc93_max: float = 93.8
+    acid_conc98_min: float = 97.6
+    acid_conc98_max: float = 98.6
+
+    # 尾气 SO2 预警线与排放限值（mg/Nm³）。
+    tail_so2_warn_mg_nm3: float = 300.0
+    tail_so2_limit_mg_nm3: float = 400.0
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None, **overrides: Any) -> "Settings":
@@ -241,6 +263,35 @@ class Settings:
                     "timeout": self.furnace_transition_timeout_seconds,
                     "purge": self.furnace_purge_seconds,
                 },
+            )
+        if self.acid_gas_flow_max_nm3h <= 0:
+            raise ValidationError(
+                "转化吸收设计烟气量上限必须为正", details={"max": self.acid_gas_flow_max_nm3h}
+            )
+        if not 0 < self.acid_converter_so2_max_percent < 100:
+            raise ValidationError(
+                "转化器入口 SO2 浓度上限必须在 (0,100) 区间",
+                details={"max": self.acid_converter_so2_max_percent},
+            )
+        if not 0 < self.acid_conversion_guaranteed < 1:
+            raise ValidationError(
+                "保证转化率必须是 (0,1) 区间比例",
+                details={"guaranteed": self.acid_conversion_guaranteed},
+            )
+        if not 0 < self.acid_conc93_min < self.acid_conc93_max <= 100:
+            raise ValidationError(
+                "93 酸浓度窗口不合法",
+                details={"min": self.acid_conc93_min, "max": self.acid_conc93_max},
+            )
+        if not 0 < self.acid_conc98_min < self.acid_conc98_max <= 100:
+            raise ValidationError(
+                "98 酸浓度窗口不合法",
+                details={"min": self.acid_conc98_min, "max": self.acid_conc98_max},
+            )
+        if not 0 < self.tail_so2_warn_mg_nm3 < self.tail_so2_limit_mg_nm3:
+            raise ValidationError(
+                "尾气 SO2 预警线必须小于排放限值",
+                details={"warn": self.tail_so2_warn_mg_nm3, "limit": self.tail_so2_limit_mg_nm3},
             )
 
     def with_root(self, root: Path | str) -> "Settings":

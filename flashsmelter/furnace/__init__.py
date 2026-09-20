@@ -13,6 +13,7 @@ from ..component import Component, ensure_actor
 from ..errors import GuardViolation, StateTransitionError
 from ..machine import StateMachine
 from ..ports import (
+    AcidPort,
     BurnerPort,
     ConverterPort,
     FeedPort,
@@ -20,6 +21,7 @@ from ..ports import (
     OxygenPort,
     SettlerPort,
     SlagPort,
+    TailGasPort,
     WastePort,
 )
 from ..runtime import RuntimeContext
@@ -66,12 +68,15 @@ class FlashFurnace(Component):
         self._matte = matte
         self._waste = waste
         self._converter = converter
+        self._acid: AcidPort | None = None
+        self._tail: TailGasPort | None = None
         self._heat_id: str | None = None
         self._started_at: str | None = None
         self._purge_started_at: float | None = None
         self._smelt_started_at: float | None = None
         self._last_tap_at: str | None = None
         self._latch_reason: str | None = None
+        self._last_derate: dict[str, Any] | None = None
         self._heats: list[dict[str, Any]] = []
         restored = self.restore()
         if restored is not None:
@@ -85,7 +90,16 @@ class FlashFurnace(Component):
             heats = restored.get("heats")
             if isinstance(heats, list):
                 self._heats = [entry for entry in heats if isinstance(entry, dict)]
+            derate = restored.get("last_derate")
+            if isinstance(derate, dict):
+                self._last_derate = derate
         self._refresh_gauges()
+
+    def bind_offgas(self, *, acid: AcidPort, tail: TailGasPort) -> None:
+        """注入制酸与尾气监视端口：喷吹门控与往安全侧带都靠它们。"""
+
+        self._acid = acid
+        self._tail = tail
 
     # ------------------------------------------------------------------ 编排
     def start(
@@ -158,6 +172,7 @@ class FlashFurnace(Component):
             self._require_startup_window()
             if self._waste.is_latched():
                 raise GuardViolation("余热锅炉闩锁未复位，禁止喷吹")
+            self._require_offgas_clear()
             conc_status = self._conc.status()
             if conc_status["state"] == "blocked" or conc_status["heat_id"] != heat_id:
                 self._conc.arm(actor, heat_id=heat_id)
@@ -369,24 +384,30 @@ class FlashFurnace(Component):
         }
 
     def status(self) -> Mapping[str, Any]:
+        subsystems = {
+            "burner": self._burner.status()["state"],
+            "oxygen": self._oxygen.status()["state"],
+            "conc": self._conc.status()["state"],
+            "settler": self._settler.status()["state"],
+            "slag": self._slag.status()["state"],
+            "matte": self._matte.status()["state"],
+            "waste": self._waste.status()["state"],
+        }
+        if self._acid is not None:
+            subsystems["acid"] = self._acid.status()["state"]
+        if self._tail is not None:
+            subsystems["tail"] = self._tail.status()["state"]
         return {
             "state": self._machine.state,
             "heat_id": self._heat_id,
             "started_at": self._started_at,
             "last_tap_at": self._last_tap_at,
             "latch_reason": self._latch_reason,
+            "last_derate": None if self._last_derate is None else dict(self._last_derate),
             "smelt_dwell_remaining_seconds": round(self.smelt_dwell_remaining(), 3),
             "purge_remaining_seconds": round(self.purge_remaining(), 3),
             "heats": list(self._heats[-4:]),
-            "subsystems": {
-                "burner": self._burner.status()["state"],
-                "oxygen": self._oxygen.status()["state"],
-                "conc": self._conc.status()["state"],
-                "settler": self._settler.status()["state"],
-                "slag": self._slag.status()["state"],
-                "matte": self._matte.status()["state"],
-                "waste": self._waste.status()["state"],
-            },
+            "subsystems": subsystems,
             "history": list(self._machine.history),
         }
 
@@ -403,6 +424,7 @@ class FlashFurnace(Component):
             "smelt_started_at": self._smelt_started_at,
             "last_tap_at": self._last_tap_at,
             "latch_reason": self._latch_reason,
+            "last_derate": self._last_derate,
             "heats": list(self._heats[-8:]),
             "history": list(self._machine.history),
         }
@@ -424,6 +446,67 @@ class FlashFurnace(Component):
                     "timeout_seconds": self.settings.furnace_transition_timeout_seconds,
                 },
             )
+
+    def _require_offgas_clear(self) -> None:
+        """制酸或尾气顶到限值时，禁止继续向炉内喷吹。
+
+        门控只问一句「能不能喷」：制酸侧处于 constrained（负荷超转化吸收能力或
+        酸浓/转化率越限）或尾气处于超排事件期间，新的喷吹一律拒绝；已在喷的由
+        对方直接调 ``bring_to_safe_side`` 先停下来。
+        """
+
+        if self._acid is not None:
+            guard = self._acid.feed_guard()
+            if not guard["ok"]:
+                raise GuardViolation(
+                    "制酸系统顶到限值，禁止喷吹",
+                    details={"acid": dict(guard)},
+                )
+        if self._tail is not None:
+            guard = self._tail.feed_guard()
+            if not guard["ok"]:
+                raise GuardViolation(
+                    "尾气排放越限，禁止喷吹",
+                    details={"tail": dict(guard)},
+                )
+
+    def bring_to_safe_side(
+        self,
+        actor: str,
+        *,
+        reason: str,
+        source: str,
+        correlation_id: str | None = None,
+    ) -> Mapping[str, Any]:
+        """制酸/尾气顶到限值时，先把炉子往安全侧带：停喷吹并留下记录。
+
+        动作是幂等的：喷吹没在跑就只留记录；在跑就先停喷吹阀。每一次触发都
+        单独落盘并写审计，处置过程事后可以逐条对上。
+        """
+
+        actor = ensure_actor(actor)
+        with self.action(
+            "derate", "furnace", actor, correlation_id=correlation_id, bump_generation=True
+        ) as trace:
+            if not reason:
+                raise GuardViolation("往安全侧带必须给出原因")
+            if not source:
+                raise GuardViolation("往安全侧带必须标注来源")
+            feed_paused = False
+            if self._conc.is_flowing():
+                self._conc.pause(actor)
+                feed_paused = True
+            self._last_derate = {
+                "reason": reason,
+                "source": source,
+                "feed_paused": feed_paused,
+                "at": self.clock.timestamp_iso(),
+            }
+            record = self._persist(reason="derate")
+            trace.attach(record).note("derate_reason", reason).note(
+                "derate_source", source
+            ).note("feed_paused", feed_paused)
+            return self.status()
 
     def _refresh_gauges(self) -> None:
         self.metrics.observe("furnace.state_code", float(STATES.index(self._machine.state)))

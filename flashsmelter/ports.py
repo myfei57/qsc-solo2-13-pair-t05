@@ -75,6 +75,33 @@ class SlagPort(Protocol):
     def status(self) -> Mapping[str, Any]: ...
 
 
+@runtime_checkable
+class AcidPort(Protocol):
+    """制酸监控对喷吹门控的查询接口。"""
+
+    def feed_guard(self) -> Mapping[str, Any]: ...
+
+    def status(self) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class TailGasPort(Protocol):
+    """尾气监视对喷吹门控的查询接口。"""
+
+    def feed_guard(self) -> Mapping[str, Any]: ...
+
+    def status(self) -> Mapping[str, Any]: ...
+
+
+@runtime_checkable
+class SafetySidePort(Protocol):
+    """制酸/尾气顶到限值时，把炉子往安全侧带的执行接口。"""
+
+    def bring_to_safe_side(
+        self, actor: str, *, reason: str, source: str, **kwargs: Any
+    ) -> Mapping[str, Any]: ...
+
+
 __all__ = [
     "BurnerPort",
     "FeedPort",
@@ -84,4 +111,7 @@ __all__ = [
     "MattePort",
     "ConverterPort",
     "SlagPort",
+    "AcidPort",
+    "TailGasPort",
+    "SafetySidePort",
 ]

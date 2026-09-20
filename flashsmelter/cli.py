@@ -144,6 +144,19 @@ def _cmd_heat(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_emissions(args: argparse.Namespace) -> int:
+    application = Application(_build_settings(args))
+    _print(
+        {
+            "tail": dict(application.tail.status()),
+            "exceedances": [dict(item) for item in application.tail.exceedances(limit=args.limit)],
+            "acid": dict(application.acid.status()),
+            "demands": [dict(item) for item in application.acid.demands(limit=args.limit)],
+        }
+    )
+    return 0
+
+
 def _cmd_verify(args: argparse.Namespace) -> int:
     application = Application(_build_settings(args))
     report = application.verify()
@@ -191,6 +204,10 @@ def build_parser() -> argparse.ArgumentParser:
     heat = subparsers.add_parser("heat", help="打印炉次与转炉批次")
     heat.add_argument("--limit", type=int, default=5)
     heat.set_defaults(func=_cmd_heat)
+
+    emissions = subparsers.add_parser("emissions", help="打印尾气超排事件与制酸前馈要求流水")
+    emissions.add_argument("--limit", type=int, default=20)
+    emissions.set_defaults(func=_cmd_emissions)
 
     verify = subparsers.add_parser("verify", help="校验落盘数据完整性")
     verify.set_defaults(func=_cmd_verify)
